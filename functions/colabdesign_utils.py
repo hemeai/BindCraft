@@ -19,8 +19,8 @@ from .generic_utils import update_failures
 
 def cache_target_features(af_model):
     """
-    Cache static target embeddings (msa_feat, residue_index, masks, templates).
-    Designed for ColabDesign single-sequence AF2 builds (no 'msa' or 'pair' keys).
+    Cache static target embeddings for single-sequence ColabDesign models.
+    Avoid slicing template features, as they may differ in alignment length.
     """
     if not hasattr(af_model, "_inputs"):
         raise ValueError("af_model._inputs not found. Run prep_inputs() first.")
@@ -36,17 +36,14 @@ def cache_target_features(af_model):
 
     cached = {}
 
-    # --- MSA features ---
-    if "msa_feat" in inputs:
-        cached["msa_feat"] = inputs["msa_feat"][..., :n_target, :]
-        print(f"[Cache] Cached msa_feat: {cached['msa_feat'].shape}")
+    # --- Per-residue or linear features (safe to slice) ---
+    for key in ["msa_feat", "residue_index", "seq_mask", "msa_mask", "msa_row_mask"]:
+        if key in inputs:
+            cached[key] = inputs[key][..., :n_target, :]
+            print(f"[Cache] Cached {key}: {np.shape(cached[key])}")
 
-    # --- Common per-residue and template features ---
+    # --- Template features (don't slice) ---
     for key in [
-        "residue_index",
-        "seq_mask",
-        "msa_mask",
-        "msa_row_mask",
         "template_aatype",
         "template_all_atom_positions",
         "template_all_atom_mask",
@@ -55,8 +52,8 @@ def cache_target_features(af_model):
         "template_pseudo_beta_mask",
     ]:
         if key in inputs:
-            cached[key] = inputs[key][:n_target]
-            print(f"[Cache] Cached {key}: {np.shape(cached[key])}")
+            cached[key] = inputs[key]
+            print(f"[Cache] Cached {key}: {np.shape(cached[key])} (unsliced)")
 
     af_model._cached_target_features = cached
     print(f"[Cache] Cached features: {list(cached.keys())}")
