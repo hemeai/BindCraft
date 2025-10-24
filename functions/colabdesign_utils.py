@@ -198,7 +198,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
     elif advanced_settings["design_algorithm"] == '4stage':
         # initial logits to prescreen trajectory
         print("Stage 1: Test Logits")
-        af_model.design_logits(iters=50, e_soft=0.9, models=design_models, num_models=1, sample_models=advanced_settings["sample_models"], save_best=True)
+        af_model.design_logits(iters=5, e_soft=0.9, models=design_models, num_models=1, sample_models=advanced_settings["sample_models"], save_best=True)
 
         # determine pLDDT of best iteration according to lowest 'loss' value
         initial_plddt = get_best_plddt(af_model, length)
@@ -235,9 +235,44 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
             # perform softmax trajectory design
             if advanced_settings["temporary_iterations"] > 0:
                 print("Stage 2: Softmax Optimisation")
+                
+                # --- Optional early stopping control ---
+                def early_stop_design(design_fn, iters, stage_name):
+                    """Wrapper to perform early stopping based on plateau in loss."""
+                    best_loss, stalled = float("inf"), 0
+                    patience = advanced_settings.get("early_stop_patience", 3)
+                    tolerance = advanced_settings.get("early_stop_tol", 1e-3)
+
+                    for i in range(iters):
+                        design_fn(1, e_temp=1e-2, models=design_models, num_models=1,
+                                    sample_models=advanced_settings["sample_models"],
+                                    ramp_recycles=False, save_best=True)
+                        losses = af_model.get_loss("loss")
+                        if len(losses) == 0:
+                            continue
+                        current_loss = float(losses[-1])
+                        if current_loss + tolerance < best_loss:
+                            best_loss = current_loss
+                            stalled = 0
+                        else:
+                            stalled += 1
+                        if stalled >= patience:
+                            print(f"[BindCraft] Early stopping in {stage_name} at iter {i}, best loss={best_loss:.4f}")
+                            break
                 af_model.clear_best()
-                af_model.design_soft(advanced_settings["temporary_iterations"], e_temp=1e-2, models=design_models, num_models=1,
-                                    sample_models=advanced_settings["sample_models"], ramp_recycles=False, save_best=True)
+
+                # decide whether to use early stop
+                if advanced_settings.get("enable_early_stop", True):
+                    early_stop_design(
+                        lambda *a, **kw: af_model.design_soft(*a, **kw),
+                        advanced_settings["temporary_iterations"],
+                        "Softmax"
+                    )
+                else:
+                    af_model.design_soft(advanced_settings["temporary_iterations"], e_temp=1e-2, models=design_models, num_models=1,
+                                        sample_models=advanced_settings["sample_models"], ramp_recycles=False, save_best=True)
+                # af_model.design_soft(advanced_settings["temporary_iterations"], e_temp=1e-2, models=design_models, num_models=1,
+                #                     sample_models=advanced_settings["sample_models"], ramp_recycles=False, save_best=True)
                 softmax_plddt = get_best_plddt(af_model, length)
             else:
                 softmax_plddt = logit_plddt
@@ -248,8 +283,17 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
                 if advanced_settings["hard_iterations"] > 0:
                     af_model.clear_best()
                     print("Stage 3: One-hot Optimisation")
-                    af_model.design_hard(advanced_settings["hard_iterations"], temp=1e-2, models=design_models, num_models=1,
-                                    sample_models=advanced_settings["sample_models"], dropout=False, ramp_recycles=False, save_best=True)
+                    if advanced_settings.get("enable_early_stop", True):
+                        early_stop_design(
+                            lambda *a, **kw: af_model.design_hard(*a, **kw),
+                            advanced_settings["hard_iterations"],
+                            "One-hot"
+                        )
+                    else:
+                        af_model.design_hard(advanced_settings["hard_iterations"], temp=1e-2, models=design_models, num_models=1,
+                                        sample_models=advanced_settings["sample_models"], dropout=False, ramp_recycles=False, save_best=True)
+                    # af_model.design_hard(advanced_settings["hard_iterations"], temp=1e-2, models=design_models, num_models=1,
+                    #                 sample_models=advanced_settings["sample_models"], dropout=False, ramp_recycles=False, save_best=True)
                     onehot_plddt = get_best_plddt(af_model, length)
 
                 if onehot_plddt > 0.65:
