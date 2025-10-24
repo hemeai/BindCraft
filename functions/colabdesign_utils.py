@@ -16,6 +16,84 @@ from colabdesign.shared.utils import copy_dict
 from .biopython_utils import hotspot_residues, calculate_clash_score, calc_ss_percentage, calculate_percentages
 from .pyrosetta_utils import pr_relax, align_pdbs
 from .generic_utils import update_failures
+from jax import lax
+
+# ----------------------------------------------------------------------
+# Helper 1: Cache static target features
+def load_or_cache_target_features(model, target_pdb, cache_path="target_feats.pkl"):
+    """
+    Compute AlphaFold2 target embeddings once and cache them locally.
+    If a cached file exists, load instead of recomputing.
+    """
+    if os.path.exists(cache_path):
+        print(f"[BindCraft] Using cached target features from {cache_path}")
+        with open(cache_path, "rb") as f:
+            target_feats = pickle.load(f)
+    else:
+        print("[BindCraft] Computing target features...")
+        target_feats = model.prep_pdb(target_pdb, chain="A", compute_target_only=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(target_feats, f)
+        print(f"[BindCraft] Saved cached features to {cache_path}")
+    return target_feats
+
+
+
+# ----------------------------------------------------------------------
+# Helper 2: Detach target features from gradient flow (JAX)
+def detach_target_features(target_feats):
+    """
+    Stop gradient flow through target features.
+    Equivalent of torch.detach() but in JAX functional style.
+    """
+    detached = {}
+    for k, v in target_feats.items():
+        if isinstance(v, (jnp.ndarray, jax.Array)):
+            detached[k] = lax.stop_gradient(v)
+        else:
+            detached[k] = v
+    print("[BindCraft] Detached gradients for target features (JAX).")
+    return detached
+
+# ----------------------------------------------------------------------
+# Helper 3: Mask interface pair features to reduce attention cost
+def mask_interface_pairs(inputs, cutoff=10.0):
+    """
+    Zero out pair features for binder–target residue pairs farther than cutoff Å.
+    Reduces compute cost for large targets by focusing attention near the interface.
+    """
+    if "atom_positions" not in inputs:
+        return inputs
+
+    pos = inputs["atom_positions"]  # [N, 37, 3]
+    chain_index = inputs.get("asym_id", None)
+    if chain_index is None:
+        return inputs
+
+    binder_id = jnp.max(chain_index)
+    binder_idx = jnp.where(chain_index == binder_id)[0]
+    target_idx = jnp.where(chain_index != binder_id)[0]
+
+    # Compute pairwise Cα–Cα distance matrix
+    dmat = jnp.linalg.norm(
+        pos[target_idx, 1, None, :] - pos[binder_idx, None, 1, :], axis=-1
+    )
+    mask = (dmat < cutoff).astype(jnp.float32)  # [N_target, N_binder]
+
+    if "pair" in inputs:
+        pf = inputs["pair"]
+        expanded_mask = jnp.expand_dims(mask, (-1, -2))
+        pf = pf.at[target_idx[:, None], binder_idx[None, :]].set(
+            pf[target_idx[:, None], binder_idx[None, :]] * expanded_mask
+        )
+        pf = pf.at[binder_idx[:, None], target_idx[None, :]].set(
+            pf[binder_idx[:, None], target_idx[None, :]] * expanded_mask
+        )
+        inputs["pair"] = pf
+        print(f"[BindCraft] Applied interface mask ({cutoff} Å).")
+    return inputs
+
+
 
 # hallucinate a binder
 def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residues, length, seed, helicity_value, design_models, advanced_settings, design_paths, failure_csv):
@@ -35,6 +113,27 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
 
     af_model.prep_inputs(pdb_filename=starting_pdb, chain=chain, binder_len=length, hotspot=target_hotspot_residues, seed=seed, rm_aa=advanced_settings["omit_AAs"],
                         rm_target_seq=advanced_settings["rm_template_seq_design"], rm_target_sc=advanced_settings["rm_template_sc_design"])
+    
+    # Optional optimization: cache & detach static target embeddings
+    cache_target_feats = True
+    # if advanced_settings.get("cache_target_feats", False):
+    if cache_target_feats is True: 
+        cache_path = os.path.join(design_paths["Trajectory"], "target_feats.pkl")
+        try:
+            with open(cache_path, "rb") as f:
+                cached_inputs = pickle.load(f)
+                af_model._inputs.update(cached_inputs)
+                print(f"[BindCraft] Loaded cached target features from {cache_path}")
+        except FileNotFoundError:
+            with open(cache_path, "wb") as f:
+                pickle.dump(af_model._inputs, f)
+            print(f"[BindCraft] Cached target features to {cache_path}")
+
+    # Stop gradients through static target (JAX)
+    for k, v in af_model._inputs.items():
+        if isinstance(v, (jnp.ndarray, jax.Array)):
+            af_model._inputs[k] = jax.lax.stop_gradient(v)
+    print("[BindCraft] Detached gradients for target (JAX).")
 
     ### Update weights based on specified settings
     af_model.opt["weights"].update({"pae":advanced_settings["weights_pae_intra"],
@@ -67,6 +166,11 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
 
     # calculate the number of mutations to do based on the length of the protein
     greedy_tries = math.ceil(length * (advanced_settings["greedy_percentage"] / 100))
+
+    #---------------------------------
+    af_model._inputs = mask_interface_pairs(af_model._inputs)
+    print("[BindCraft] Applied interface mask (10 Å).")
+    #---------------------------------
 
     ### start design algorithm based on selection
     if advanced_settings["design_algorithm"] == '2stage':
