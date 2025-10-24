@@ -204,7 +204,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
         initial_plddt = get_best_plddt(af_model, length)
         
         # if best iteration has high enough confidence then continue
-        if initial_plddt > 0.65:
+        if initial_plddt > 0.90:
             print("Initial trajectory pLDDT good, continuing: "+str(initial_plddt))
             if advanced_settings["optimise_beta"]:
                 # temporarily dump model to assess secondary structure
