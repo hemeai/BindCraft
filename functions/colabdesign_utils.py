@@ -17,6 +17,59 @@ from .biopython_utils import hotspot_residues, calculate_clash_score, calc_ss_pe
 from .pyrosetta_utils import pr_relax, align_pdbs
 from .generic_utils import update_failures
 
+def cache_target_features(af_model):
+    """
+    Cache static target embeddings (MSA, pair, residue index, mask)
+    so they can be reused in subsequent iterations without recomputation.
+    This should be called once after prep_inputs().
+    """
+    if not hasattr(af_model, "_inputs"):
+        raise ValueError("af_model._inputs not found. Run prep_inputs() first.")
+
+    if hasattr(af_model, "_cached_target_features"):
+        print("[Cache] Target features already cached.")
+        return
+
+    n_target = af_model._target_len
+    inputs = af_model._inputs
+
+    print(f"[Cache] Caching static target embeddings for {n_target} residues...")
+
+    # Extract static slices
+    af_model._cached_target_features = {
+        "msa": jax.tree.map(lambda x: x[:, :n_target, :], inputs["msa"]),
+        "pair": inputs["pair"][:n_target, :n_target, :],
+        "residue_index": inputs["residue_index"][:n_target],
+        "seq_mask": inputs["seq_mask"][:n_target],
+    }
+
+    print("[Cache] Done — static features stored in af_model._cached_target_features")
+
+
+def inject_target_cache(af_model):
+    """
+    Inject cached static target embeddings into current AF2 inputs.
+    This should be called before each design() or step() call.
+    """
+    if not hasattr(af_model, "_cached_target_features"):
+        print("[Cache] No cached target features found — skipping injection.")
+        return
+
+    cached = af_model._cached_target_features
+    inputs = af_model._inputs
+    n_target = af_model._target_len
+
+    # Replace static regions (target part)
+    af_model._inputs = inputs.copy()
+    af_model._inputs["msa"] = inputs["msa"].at[:, :n_target, :].set(cached["msa"])
+    af_model._inputs["pair"] = inputs["pair"].at[:n_target, :n_target, :].set(cached["pair"])
+    af_model._inputs["residue_index"] = inputs["residue_index"].at[:n_target].set(cached["residue_index"])
+    af_model._inputs["seq_mask"] = inputs["seq_mask"].at[:n_target].set(cached["seq_mask"])
+
+    # Freeze gradients for target residues
+    af_model.opt["stop_grad"] = (0, n_target)
+
+
 # hallucinate a binder
 def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residues, length, seed, helicity_value, design_models, advanced_settings, design_paths, failure_csv):
     model_pdb_path = os.path.join(design_paths["Trajectory"], design_name+".pdb")
@@ -35,6 +88,9 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
 
     af_model.prep_inputs(pdb_filename=starting_pdb, chain=chain, binder_len=length, hotspot=target_hotspot_residues, seed=seed, rm_aa=advanced_settings["omit_AAs"],
                         rm_target_seq=advanced_settings["rm_template_seq_design"], rm_target_sc=advanced_settings["rm_template_sc_design"])
+
+    # Cache static target embeddings (only once)
+    cache_target_features(af_model)
 
     ### Update weights based on specified settings
     af_model.opt["weights"].update({"pae":advanced_settings["weights_pae_intra"],
@@ -94,6 +150,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
     elif advanced_settings["design_algorithm"] == '4stage':
         # initial logits to prescreen trajectory
         print("Stage 1: Test Logits")
+        inject_target_cache(af_model)
         af_model.design_logits(iters=50, e_soft=0.9, models=design_models, num_models=1, sample_models=advanced_settings["sample_models"], save_best=True)
 
         # determine pLDDT of best iteration according to lowest 'loss' value
@@ -120,6 +177,8 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
             if logits_iter > 0:
                 print("Stage 1: Additional Logits Optimisation")
                 af_model.clear_best()
+                
+                inject_target_cache(af_model)
                 af_model.design_logits(iters=logits_iter, e_soft=1, models=design_models, num_models=1, sample_models=advanced_settings["sample_models"],
                                     ramp_recycles=False, save_best=True)
                 af_model._tmp["seq_logits"] = af_model.aux["seq"]["logits"]
@@ -132,6 +191,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
             if advanced_settings["temporary_iterations"] > 0:
                 print("Stage 2: Softmax Optimisation")
                 af_model.clear_best()
+                inject_target_cache(af_model)
                 af_model.design_soft(advanced_settings["temporary_iterations"], e_temp=1e-2, models=design_models, num_models=1,
                                     sample_models=advanced_settings["sample_models"], ramp_recycles=False, save_best=True)
                 softmax_plddt = get_best_plddt(af_model, length)
@@ -144,6 +204,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
                 if advanced_settings["hard_iterations"] > 0:
                     af_model.clear_best()
                     print("Stage 3: One-hot Optimisation")
+                    inject_target_cache(af_model)
                     af_model.design_hard(advanced_settings["hard_iterations"], temp=1e-2, models=design_models, num_models=1,
                                     sample_models=advanced_settings["sample_models"], dropout=False, ramp_recycles=False, save_best=True)
                     onehot_plddt = get_best_plddt(af_model, length)
@@ -153,6 +214,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
                     print("One-hot trajectory pLDDT good, continuing: "+str(onehot_plddt))
                     if advanced_settings["greedy_iterations"] > 0:
                         print("Stage 4: PSSM Semigreedy Optimisation")
+                        inject_target_cache(af_model)
                         af_model.design_pssm_semigreedy(soft_iters=0, hard_iters=advanced_settings["greedy_iterations"], tries=greedy_tries, models=design_models, 
                                                         num_models=1, sample_models=advanced_settings["sample_models"], ramp_models=False, save_best=True)
 
