@@ -19,55 +19,47 @@ from .generic_utils import update_failures
 
 def cache_target_features(af_model):
     """
-    Cache static target embeddings (MSA, pair, residue index, mask)
-    so they can be reused in subsequent iterations without recomputation.
-    This should be called once after prep_inputs().
+    Cache static target embeddings (msa_feat, residue_index, masks, templates).
+    Designed for ColabDesign single-sequence AF2 builds (no 'msa' or 'pair' keys).
     """
     if not hasattr(af_model, "_inputs"):
         raise ValueError("af_model._inputs not found. Run prep_inputs() first.")
+
+    inputs = af_model._inputs
+    n_target = af_model._target_len
 
     if hasattr(af_model, "_cached_target_features"):
         print("[Cache] Target features already cached.")
         return
 
-    n_target = af_model._target_len
-    inputs = af_model._inputs
+    print(f"[Cache] Caching target features for {n_target} residues...")
 
-    print(f"[Cache] Caching static target embeddings for {n_target} residues...")
+    cached = {}
 
-    # Extract static slices
-    af_model._cached_target_features = {
-        "msa": jax.tree.map(lambda x: x[:, :n_target, :], inputs["msa"]),
-        "pair": inputs["pair"][:n_target, :n_target, :],
-        "residue_index": inputs["residue_index"][:n_target],
-        "seq_mask": inputs["seq_mask"][:n_target],
-    }
+    # --- MSA features ---
+    if "msa_feat" in inputs:
+        cached["msa_feat"] = inputs["msa_feat"][..., :n_target, :]
+        print(f"[Cache] Cached msa_feat: {cached['msa_feat'].shape}")
 
-    print("[Cache] Done — static features stored in af_model._cached_target_features")
+    # --- Common per-residue and template features ---
+    for key in [
+        "residue_index",
+        "seq_mask",
+        "msa_mask",
+        "msa_row_mask",
+        "template_aatype",
+        "template_all_atom_positions",
+        "template_all_atom_mask",
+        "template_mask",
+        "template_pseudo_beta",
+        "template_pseudo_beta_mask",
+    ]:
+        if key in inputs:
+            cached[key] = inputs[key][:n_target]
+            print(f"[Cache] Cached {key}: {np.shape(cached[key])}")
 
-
-def inject_target_cache(af_model):
-    """
-    Inject cached static target embeddings into current AF2 inputs.
-    This should be called before each design() or step() call.
-    """
-    if not hasattr(af_model, "_cached_target_features"):
-        print("[Cache] No cached target features found — skipping injection.")
-        return
-
-    cached = af_model._cached_target_features
-    inputs = af_model._inputs
-    n_target = af_model._target_len
-
-    # Replace static regions (target part)
-    af_model._inputs = inputs.copy()
-    af_model._inputs["msa"] = inputs["msa"].at[:, :n_target, :].set(cached["msa"])
-    af_model._inputs["pair"] = inputs["pair"].at[:n_target, :n_target, :].set(cached["pair"])
-    af_model._inputs["residue_index"] = inputs["residue_index"].at[:n_target].set(cached["residue_index"])
-    af_model._inputs["seq_mask"] = inputs["seq_mask"].at[:n_target].set(cached["seq_mask"])
-
-    # Freeze gradients for target residues
-    af_model.opt["stop_grad"] = (0, n_target)
+    af_model._cached_target_features = cached
+    print(f"[Cache] Cached features: {list(cached.keys())}")
 
 
 # hallucinate a binder
@@ -150,7 +142,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
     elif advanced_settings["design_algorithm"] == '4stage':
         # initial logits to prescreen trajectory
         print("Stage 1: Test Logits")
-        inject_target_cache(af_model)
+        af_model._inputs.update(af_model._cached_target_features)
         af_model.design_logits(iters=50, e_soft=0.9, models=design_models, num_models=1, sample_models=advanced_settings["sample_models"], save_best=True)
 
         # determine pLDDT of best iteration according to lowest 'loss' value
@@ -178,7 +170,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
                 print("Stage 1: Additional Logits Optimisation")
                 af_model.clear_best()
                 
-                inject_target_cache(af_model)
+                af_model._inputs.update(af_model._cached_target_features)
                 af_model.design_logits(iters=logits_iter, e_soft=1, models=design_models, num_models=1, sample_models=advanced_settings["sample_models"],
                                     ramp_recycles=False, save_best=True)
                 af_model._tmp["seq_logits"] = af_model.aux["seq"]["logits"]
@@ -191,7 +183,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
             if advanced_settings["temporary_iterations"] > 0:
                 print("Stage 2: Softmax Optimisation")
                 af_model.clear_best()
-                inject_target_cache(af_model)
+                af_model._inputs.update(af_model._cached_target_features)
                 af_model.design_soft(advanced_settings["temporary_iterations"], e_temp=1e-2, models=design_models, num_models=1,
                                     sample_models=advanced_settings["sample_models"], ramp_recycles=False, save_best=True)
                 softmax_plddt = get_best_plddt(af_model, length)
@@ -204,7 +196,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
                 if advanced_settings["hard_iterations"] > 0:
                     af_model.clear_best()
                     print("Stage 3: One-hot Optimisation")
-                    inject_target_cache(af_model)
+                    af_model._inputs.update(af_model._cached_target_features)
                     af_model.design_hard(advanced_settings["hard_iterations"], temp=1e-2, models=design_models, num_models=1,
                                     sample_models=advanced_settings["sample_models"], dropout=False, ramp_recycles=False, save_best=True)
                     onehot_plddt = get_best_plddt(af_model, length)
@@ -214,7 +206,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
                     print("One-hot trajectory pLDDT good, continuing: "+str(onehot_plddt))
                     if advanced_settings["greedy_iterations"] > 0:
                         print("Stage 4: PSSM Semigreedy Optimisation")
-                        inject_target_cache(af_model)
+                        af_model._inputs.update(af_model._cached_target_features)
                         af_model.design_pssm_semigreedy(soft_iters=0, hard_iters=advanced_settings["greedy_iterations"], tries=greedy_tries, models=design_models, 
                                                         num_models=1, sample_models=advanced_settings["sample_models"], ramp_models=False, save_best=True)
 
