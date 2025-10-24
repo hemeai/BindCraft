@@ -65,5 +65,6 @@
   "dalphaball_path": "",
   "enable_early_stop": true,
   "early_stop_patience": 3,
-  "early_stop_tol": 1e-3
+  "early_stop_tol": 1e-3,
+  "cache_target_feats": true
 }

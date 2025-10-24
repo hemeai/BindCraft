@@ -17,6 +17,7 @@ from .biopython_utils import hotspot_residues, calculate_clash_score, calc_ss_pe
 from .pyrosetta_utils import pr_relax, align_pdbs
 from .generic_utils import update_failures
 from jax import lax
+import time 
 
 # ----------------------------------------------------------------------
 # Helper 1: Cache static target features
@@ -115,9 +116,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
                         rm_target_seq=advanced_settings["rm_template_seq_design"], rm_target_sc=advanced_settings["rm_template_sc_design"])
     
     # Optional optimization: cache & detach static target embeddings
-    cache_target_feats = True
-    # if advanced_settings.get("cache_target_feats", False):
-    if cache_target_feats is True: 
+    if advanced_settings.get("cache_target_feats", False):
         cache_path = os.path.join(design_paths["Trajectory"], "target_feats.pkl")
         try:
             with open(cache_path, "rb") as f:
@@ -196,13 +195,15 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
                                 sample_models=advanced_settings["sample_models"], save_best=True)
 
     elif advanced_settings["design_algorithm"] == '4stage':
+
+        t0 = time.time()
         # initial logits to prescreen trajectory
         print("Stage 1: Test Logits")
         af_model.design_logits(iters=5, e_soft=0.9, models=design_models, num_models=1, sample_models=advanced_settings["sample_models"], save_best=True)
-
         # determine pLDDT of best iteration according to lowest 'loss' value
         initial_plddt = get_best_plddt(af_model, length)
-        
+        print(f"[Timing] design_logits took {time.time() - t0:.2f} sec")
+
         # if best iteration has high enough confidence then continue
         if initial_plddt > 0.25:
             print("Initial trajectory pLDDT good, continuing: "+str(initial_plddt))
