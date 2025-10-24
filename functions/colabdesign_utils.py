@@ -19,9 +19,11 @@ from .generic_utils import update_failures
 
 def cache_target_features(af_model):
     """
-    Cache static target embeddings for single-sequence ColabDesign models.
-    Avoid slicing template features, as they may differ in alignment length.
+    Cache static target embeddings (msa_feat, residue_index, masks, templates).
+    Handles different array ranks safely (1D, 2D, 3D).
     """
+    import numpy as np
+
     if not hasattr(af_model, "_inputs"):
         raise ValueError("af_model._inputs not found. Run prep_inputs() first.")
 
@@ -36,13 +38,23 @@ def cache_target_features(af_model):
 
     cached = {}
 
-    # --- Per-residue or linear features (safe to slice) ---
     for key in ["msa_feat", "residue_index", "seq_mask", "msa_mask", "msa_row_mask"]:
         if key in inputs:
-            cached[key] = inputs[key][..., :n_target, :]
-            print(f"[Cache] Cached {key}: {np.shape(cached[key])}")
+            arr = inputs[key]
+            ndim = arr.ndim
 
-    # --- Template features (don't slice) ---
+            if ndim == 1:
+                cached[key] = arr[:n_target]
+            elif ndim == 2:
+                cached[key] = arr[..., :n_target]
+            elif ndim >= 3:
+                cached[key] = arr[..., :n_target, :]
+            else:
+                cached[key] = arr
+
+            print(f"[Cache] Cached {key}: shape {arr.shape} → {np.shape(cached[key])}")
+
+    # --- Template features (don’t slice, different alignment space) ---
     for key in [
         "template_aatype",
         "template_all_atom_positions",
@@ -53,7 +65,7 @@ def cache_target_features(af_model):
     ]:
         if key in inputs:
             cached[key] = inputs[key]
-            print(f"[Cache] Cached {key}: {np.shape(cached[key])} (unsliced)")
+            print(f"[Cache] Cached {key}: {np.shape(inputs[key])} (unsliced)")
 
     af_model._cached_target_features = cached
     print(f"[Cache] Cached features: {list(cached.keys())}")
