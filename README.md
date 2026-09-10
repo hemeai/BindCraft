@@ -104,6 +104,12 @@ use_rg_loss                     -> use radius of gyration loss?
 weights_rg                      -> Design weight - radius of gyration weight for binder
 use_termini_distance_loss       -> Try to minimise distance between N- and C-terminus of binder? Helpful for grafting
 weights_termini_loss            -> Design weight - N- and C-terminus distance minimisation weight of binder
+use_shape_reference_loss        -> Bias the binder's backbone fold to resemble a chosen reference protein (e.g. a scaffold you like), while it still optimises for binding the target
+weights_shape_reference         -> Design weight - strength of the fold-similarity bias towards the reference protein
+use_seq_reference_loss          -> Bias the binder's designed sequence to resemble the reference protein's sequence
+weights_seq_reference           -> Design weight - strength of the sequence-similarity bias towards the reference protein
+reference_protein_pdb           -> Path to the PDB file of the reference protein whose shape/sequence you want the binder to look like
+reference_protein_chain         -> Chain ID of the reference protein to use (default "A"). If the reference is longer than the sampled binder length, a random contiguous window is used each trajectory; if shorter, the extra binder positions are left unconstrained
 
 # MPNN settings
 mpnn_fix_interface              -> whether to fix the interface designed in the starting trajectory

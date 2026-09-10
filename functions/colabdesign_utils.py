@@ -2,7 +2,7 @@
 ############## ColabDesign functions
 ####################################
 ### Import dependencies
-import os, re, shutil, math, pickle
+import os, re, shutil, math, pickle, functools
 import matplotlib.pyplot as plt
 import numpy as np
 import jax
@@ -12,6 +12,7 @@ from colabdesign import mk_afdesign_model, clear_mem
 from colabdesign.mpnn import mk_mpnn_model
 from colabdesign.af.alphafold.common import residue_constants
 from colabdesign.af.loss import get_ptm, mask_loss, get_dgram_bins, _get_con_loss
+from colabdesign.af.prep import prep_pdb
 from colabdesign.shared.utils import copy_dict
 from .biopython_utils import hotspot_residues, calculate_clash_score, calc_ss_percentage, calculate_percentages
 from .pyrosetta_utils import pr_relax, align_pdbs
@@ -61,6 +62,10 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
     if advanced_settings["use_termini_distance_loss"]:
         # termini distance loss
         add_termini_distance_loss(af_model, advanced_settings["weights_termini_loss"])
+
+    if advanced_settings.get("use_shape_reference_loss") or advanced_settings.get("use_seq_reference_loss"):
+        # bias the binder towards resembling a reference protein of choice (fold and/or sequence)
+        add_reference_protein_losses(af_model, advanced_settings, length, seed)
 
     # add the helicity loss
     add_helix_loss(af_model, helicity_value)
@@ -453,9 +458,116 @@ def add_termini_distance_loss(self, weight=0.1, threshold_distance=7.0):
     self._callbacks["model"]["loss"].append(loss_fn)
     self.opt["weights"]["NC"] = weight
 
+# parse and cache a reference protein's structure/sequence for the reference-similarity losses
+@functools.lru_cache(maxsize=8)
+def _load_reference_protein(reference_pdb, reference_chain):
+    '''Parse the reference PDB once (cached) and extract per-residue pseudo-beta (CB) coordinates,
+    a validity mask, and the amino acid sequence. This is the protein whose fold and/or sequence
+    the binder should be biased to resemble, independent of the target being bound.'''
+    ref = prep_pdb(reference_pdb, chain=reference_chain, ignore_missing=True)
+    batch = ref["batch"]
+    cb_idx = residue_constants.atom_order["CB"]
+    cb_pos = np.array(batch["all_atom_positions"][:, cb_idx, :], dtype=np.float32)
+    cb_mask = np.array(batch["all_atom_mask"][:, cb_idx], dtype=np.float32)
+    aatype = np.array(batch["aatype"], dtype=np.int32)
+    return {"cb_pos": cb_pos, "cb_mask": cb_mask, "aatype": aatype, "length": int(cb_pos.shape[0])}
+
+# crop/pad a reference protein's per-residue features to match the current binder length
+def _fit_reference_to_length(reference, binder_len, seed=0):
+    '''Align the reference protein's features to the binder length being designed this trajectory.
+    If the reference is longer than the binder, a contiguous window is randomly chosen (seeded per
+    trajectory so it is reproducible) so different trajectories can sample different fragments of the
+    reference fold. If the reference is shorter, the extra binder positions are left unconstrained
+    (mask 0) rather than fabricating structure/sequence that isn't there.'''
+    ref_len = reference["length"]
+    window = min(ref_len, binder_len)
+
+    if ref_len > binder_len:
+        rng = np.random.RandomState(seed % (2**32 - 1))
+        offset = int(rng.randint(0, ref_len - binder_len + 1))
+    else:
+        offset = 0
+
+    cb_pos = reference["cb_pos"][offset:offset + window]
+    cb_mask = reference["cb_mask"][offset:offset + window]
+    aatype = reference["aatype"][offset:offset + window]
+
+    if window < binder_len:
+        pad = binder_len - window
+        cb_pos = np.pad(cb_pos, ((0, pad), (0, 0)))
+        cb_mask = np.pad(cb_mask, (0, pad))
+        aatype = np.pad(aatype, (0, pad))
+
+    return cb_pos, cb_mask, aatype
+
+# load the reference protein and attach the requested similarity losses to the binder region
+def add_reference_protein_losses(af_model, advanced_settings, length, seed):
+    '''Set up the reference-protein similarity losses ("make the binder look like this protein"),
+    used on top of the normal binder-vs-target losses.'''
+    reference_pdb = advanced_settings.get("reference_protein_pdb")
+    if not reference_pdb:
+        print("WARNING: reference-protein similarity loss is enabled but 'reference_protein_pdb' is not set in the advanced settings, skipping")
+        return
+
+    reference_chain = advanced_settings.get("reference_protein_chain") or "A"
+    reference = _load_reference_protein(reference_pdb, reference_chain)
+    ref_cb_pos, ref_cb_mask, ref_aatype = _fit_reference_to_length(reference, length, seed=seed)
+
+    if reference["length"] != length:
+        print(f"Reference protein '{os.path.basename(reference_pdb)}' is {reference['length']} aa, binder trajectory is {length} aa; "
+              f"using a {min(reference['length'], length)}-residue aligned window for the reference-similarity loss(es).")
+
+    if advanced_settings.get("use_shape_reference_loss"):
+        add_reference_shape_loss(af_model, advanced_settings.get("weights_shape_reference", 0.5), ref_cb_pos, ref_cb_mask)
+
+    if advanced_settings.get("use_seq_reference_loss"):
+        add_reference_sequence_loss(af_model, advanced_settings.get("weights_seq_reference", 0.5), ref_aatype, ref_cb_mask)
+
+# add reference-protein fold (shape) similarity loss
+def add_reference_shape_loss(self, weight, ref_cb_pos, ref_cb_mask):
+    '''Bias the binder's backbone fold toward a chosen reference protein by minimising the
+    cross-entropy between the predicted intra-binder distogram and the CB-CB distance
+    distribution of the reference protein (same distogram-cce principle AlphaFold hallucination
+    uses for motif scaffolding, applied here to the free binder region of the binder protocol).'''
+    ref_cb_pos = jnp.asarray(ref_cb_pos)
+    ref_cb_mask = jnp.asarray(ref_cb_mask)
+    pair_mask = ref_cb_mask[:, None] * ref_cb_mask[None, :]
+
+    # true reference distogram, binned identically to the AF2 distogram head
+    dm = jnp.square(ref_cb_pos[:, None] - ref_cb_pos[None, :]).sum(-1, keepdims=True)
+
+    def loss_fn(inputs, outputs):
+        pred = outputs["distogram"]["logits"][-self._binder_len:, -self._binder_len:]
+        bin_edges = jnp.linspace(2.3125, 21.6875, pred.shape[-1] - 1)
+        true = jax.nn.one_hot((dm > jnp.square(bin_edges)).sum(-1), pred.shape[-1])
+
+        cce = -(true * jax.nn.log_softmax(pred)).sum(-1)
+        loss = (cce * pair_mask).sum() / (pair_mask.sum() + 1e-8)
+        return {"fold_ref": loss}
+
+    self._callbacks["model"]["loss"].append(loss_fn)
+    self.opt["weights"]["fold_ref"] = weight
+
+# add reference-protein sequence similarity loss
+def add_reference_sequence_loss(self, weight, ref_aatype, ref_mask):
+    '''Bias the binder's designed sequence distribution toward a chosen reference protein's
+    sequence via a soft cross-entropy loss, on top of whatever binding-driven mutations are
+    needed at the interface.'''
+    ref_onehot = jax.nn.one_hot(jnp.asarray(ref_aatype), 20)
+    ref_mask = jnp.asarray(ref_mask)
+
+    def loss_fn(inputs, outputs):
+        seq = inputs["seq"]["soft"][0, :, :20]
+        cce = -(ref_onehot * jnp.log(seq + 1e-8)).sum(-1)
+        loss = (cce * ref_mask).sum() / (ref_mask.sum() + 1e-8)
+        return {"seq_ref": loss}
+
+    self._callbacks["model"]["loss"].append(loss_fn)
+    self.opt["weights"]["seq_ref"] = weight
+
 # plot design trajectory losses
 def plot_trajectory(af_model, design_name, design_paths):
-    metrics_to_plot = ['loss', 'plddt', 'ptm', 'i_ptm', 'con', 'i_con', 'pae', 'i_pae', 'rg', 'mpnn']
+    metrics_to_plot = ['loss', 'plddt', 'ptm', 'i_ptm', 'con', 'i_con', 'pae', 'i_pae', 'rg', 'mpnn', 'fold_ref', 'seq_ref']
     colors = ['b', 'g', 'r', 'c', 'm', 'y', 'k']
 
     for index, metric in enumerate(metrics_to_plot):

@@ -252,6 +252,16 @@ def perform_advanced_settings_check(advanced_settings, bindcraft_folder):
     elif isinstance(advanced_settings["omit_AAs"], str):
         advanced_settings["omit_AAs"] = advanced_settings["omit_AAs"].strip()
 
+    # reference-protein similarity losses ("make the binder look like this protein"), off by
+    # default and backfilled here so advanced settings files created before this feature existed
+    # keep working without modification
+    advanced_settings.setdefault("use_shape_reference_loss", False)
+    advanced_settings.setdefault("weights_shape_reference", 0.5)
+    advanced_settings.setdefault("use_seq_reference_loss", False)
+    advanced_settings.setdefault("weights_seq_reference", 0.5)
+    advanced_settings.setdefault("reference_protein_pdb", "")
+    advanced_settings.setdefault("reference_protein_chain", "A")
+
     return advanced_settings
 
 # Load settings from JSONs
